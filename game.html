@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NEON DRIFT — a one-file canvas game</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05060f; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center;
+         font-family: "Segoe UI", system-ui, sans-serif; }
+  #wrap { position: relative; width: min(100vw, 177.78vh); }
+  canvas { display: block; width: 100%; background: #070818;
+           box-shadow: 0 0 60px rgba(0,229,255,.25), 0 0 140px rgba(255,43,214,.12); }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="960" height="540"></canvas></div>
+<script>
+"use strict";
+// ============================================================
+//  NEON DRIFT — one file, no libraries.
+//  Dodge the asteroids. Collect the stars. The drift only
+//  gets faster. Steer with the arrow keys / WASD, the mouse,
+//  or a finger. SPACE starts, R restarts.
+// ============================================================
+const cv = document.getElementById("game");
+const ctx = cv.getContext("2d");
+const W = cv.width, H = cv.height;
+
+// ---------- helpers ----------
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const TAU = Math.PI * 2;
+
+// ---------- background starfield (3 parallax layers) ----------
+const layers = [];
+for (let l = 0; l < 3; l++) {
+  const stars = [];
+  const n = [90, 60, 34][l];
+  for (let i = 0; i < n; i++)
+    stars.push({ x: Math.random() * W, y: Math.random() * H,
+                 r: [1, 1.6, 2.4][l], tw: rand(0, TAU) });
+  layers.push({ stars, speed: [26, 55, 105][l],
+                color: ["#3d4470", "#6f7bb8", "#cfd8ff"][l] });
+}
+
+// ---------- the ship ----------
+const ship = { x: W / 2, y: H - 90, vx: 0, vy: 0, r: 13, tilt: 0, alive: true };
+const keys = {};
+let pointer = null;
+let paused = false;
+addEventListener("keydown", e => {
+  keys[e.key.toLowerCase()] = true;
+  if (e.key === " " || e.key.startsWith("Arrow")) e.preventDefault();
+  if (state === "play" && (e.key === "p" || e.key === "P")) paused = !paused;
+  if (state === "title" && (e.key === " " || e.key === "Enter")) startGame();
+  if (state === "over" && (e.key === "r" || e.key === "R" || e.key === " ")) startGame();
+});
+addEventListener("keyup", e => keys[e.key.toLowerCase()] = false);
+cv.addEventListener("pointermove", e => {
+  const b = cv.getBoundingClientRect();
+  pointer = { x: (e.clientX - b.left) * W / b.width,
+              y: (e.clientY - b.top) * H / b.height };
+});
+cv.addEventListener("pointerdown", () => { if (state !== "play") startGame(); });
+
+// ---------- rocks and stars ----------
+let rocks = [], gems = [], parts = [], floaters = [];
+function spawnRock(speed) {
+  const r = rand(16, 44), pts = [];
+  const n = 9 + (Math.random() * 4 | 0);
+  for (let i = 0; i < n; i++) {
+    const a = i / n * TAU, d = r * rand(0.72, 1.08);
+    pts.push({ x: Math.cos(a) * d, y: Math.sin(a) * d });
+  }
+  rocks.push({ x: rand(r, W - r), y: -r - 10, r, pts,
+               vy: speed * rand(0.85, 1.25), vx: rand(-24, 24),
+               rot: rand(0, TAU), vr: rand(-1.4, 1.4) });
+}
+function spawnGem(speed) {
+  gems.push({ x: rand(30, W - 30), y: -24, r: 11,
+              vy: speed * rand(0.55, 0.75), tw: rand(0, TAU) });
+}
+function burst(x, y, color, n, power) {
+  for (let i = 0; i < n; i++) {
+    const a = rand(0, TAU), s = rand(30, power);
+    parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s,
+                 life: rand(0.35, 0.9), age: 0, color, r: rand(1.5, 3.5) });
+  }
+}
+
+// ---------- game state ----------
+let state = "title";           // title | play | over
+let score = 0, best = 0, t = 0, speedMul = 1, rockTimer = 0, gemTimer = 1.2;
+function startGame() {
+  score = 0; t = 0; speedMul = 1; rocks = []; gems = []; parts = []; floaters = [];
+  ship.x = W / 2; ship.y = H - 90; ship.vx = ship.vy = 0; ship.alive = true;
+  rockTimer = 0.4; gemTimer = 0.8; state = "play";
+}
+
+// ---------- update ----------
+function update(dt) {
+  for (const L of layers) for (const s of L.stars) {
+    s.y += (L.speed * (state === "play" ? speedMul : 0.35)) * dt;
+    s.tw += dt * 3;
+    if (s.y > H + 3) { s.y = -3; s.x = Math.random() * W; }
+  }
+  if (state !== "play") { updateParts(dt); return; }
+
+  t += dt;
+  speedMul = 1 + t / 22;                       // the ramp: +1x every 22 s
+  const fall = 235 * speedMul;
+
+  // steering: keys accelerate, pointer attracts
+  const ACC = 2600, MAXV = 430;
+  if (keys["arrowleft"] || keys["a"]) ship.vx -= ACC * dt;
+  if (keys["arrowright"] || keys["d"]) ship.vx += ACC * dt;
+  if (keys["arrowup"] || keys["w"]) ship.vy -= ACC * dt;
+  if (keys["arrowdown"] || keys["s"]) ship.vy += ACC * dt;
+  if (pointer) {
+    ship.vx += clamp((pointer.x - ship.x) * 14, -ACC, ACC) * dt;
+    ship.vy += clamp((pointer.y - ship.y) * 14, -ACC, ACC) * dt;
+  }
+  ship.vx *= Math.pow(0.0015, dt); ship.vy *= Math.pow(0.0015, dt);
+  ship.vx = clamp(ship.vx, -MAXV, MAXV); ship.vy = clamp(ship.vy, -MAXV, MAXV);
+  ship.x = clamp(ship.x + ship.vx * dt, ship.r + 4, W - ship.r - 4);
+  ship.y = clamp(ship.y + ship.vy * dt, ship.r + 40, H - ship.r - 6);
+  ship.tilt = clamp(ship.vx / MAXV, -1, 1) * 0.42;
+
+  // spawns get denser as the speed climbs
+  rockTimer -= dt;
+  if (rockTimer <= 0) { spawnRock(fall); rockTimer = rand(0.34, 0.8) / Math.sqrt(speedMul); }
+  gemTimer -= dt;
+  if (gemTimer <= 0) { spawnGem(fall); gemTimer = rand(1.1, 2.4); }
+
+  // rocks
+  for (const r of rocks) {
+    r.x += r.vx * dt; r.y += r.vy * dt; r.rot += r.vr * dt;
+    const dx = r.x - ship.x, dy = r.y - ship.y;
+    if (dx * dx + dy * dy < (r.r * 0.82 + ship.r) ** 2) {
+      ship.alive = false; state = "over";
+      best = Math.max(best, score);
+      burst(ship.x, ship.y, "#00e5ff", 42, 320);
+      burst(ship.x, ship.y, "#ff2bd6", 26, 240);
+      burst(ship.x, ship.y, "#ffd94d", 18, 180);
+    }
+  }
+  rocks = rocks.filter(r => r.y < H + 70);
+
+  // gems: collect for +10
+  for (const g of gems) {
+    g.y += g.vy * dt; g.tw += dt * 6;
+    const dx = g.x - ship.x, dy = g.y - ship.y;
+    if (dx * dx + dy * dy < (g.r + ship.r + 7) ** 2) {
+      g.dead = true; score += 10;
+      burst(g.x, g.y, "#ffd94d", 12, 150);
+      floaters.push({ x: g.x, y: g.y - 14, txt: "+10", age: 0 });
+    }
+  }
+  gems = gems.filter(g => !g.dead && g.y < H + 30);
+
+  for (const f of floaters) { f.y -= 42 * dt; f.age += dt; }
+  floaters = floaters.filter(f => f.age < 0.9);
+  updateParts(dt);
+}
+function updateParts(dt) {
+  for (const p of parts) {
+    p.age += dt; p.x += p.vx * dt; p.y += p.vy * dt;
+    p.vx *= 0.98; p.vy *= 0.98;
+  }
+  parts = parts.filter(p => p.age < p.life);
+}
+
+// ---------- drawing ----------
+function drawShip() {
+  ctx.save();
+  ctx.translate(ship.x, ship.y); ctx.rotate(ship.tilt);
+  // engine flame
+  const fl = 16 + Math.random() * 9;
+  ctx.beginPath();
+  ctx.moveTo(-6, 13); ctx.lineTo(0, 13 + fl); ctx.lineTo(6, 13); ctx.closePath();
+  ctx.fillStyle = "rgba(255,150,40,.9)"; ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(-3.4, 13); ctx.lineTo(0, 13 + fl * 0.55); ctx.lineTo(3.4, 13); ctx.closePath();
+  ctx.fillStyle = "rgba(255,230,150,.95)"; ctx.fill();
+  // hull
+  ctx.beginPath();
+  ctx.moveTo(0, -18); ctx.lineTo(12, 12); ctx.lineTo(4, 7);
+  ctx.lineTo(-4, 7); ctx.lineTo(-12, 12); ctx.closePath();
+  ctx.shadowColor = "#00e5ff"; ctx.shadowBlur = 18;
+  ctx.fillStyle = "#0e2a3d"; ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = "#00e5ff"; ctx.lineWidth = 2.2; ctx.stroke();
+  // cockpit
+  ctx.beginPath(); ctx.arc(0, -4, 4.2, 0, TAU);
+  ctx.fillStyle = "#bffcff"; ctx.fill();
+  ctx.restore();
+}
+function drawRock(r) {
+  ctx.save(); ctx.translate(r.x, r.y); ctx.rotate(r.rot);
+  ctx.beginPath();
+  r.pts.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
+  ctx.closePath();
+  ctx.fillStyle = "#2b2438"; ctx.fill();
+  ctx.strokeStyle = "#8d7fb8"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.beginPath(); ctx.arc(-r.r * 0.25, -r.r * 0.15, r.r * 0.18, 0, TAU);
+  ctx.strokeStyle = "rgba(141,127,184,.55)"; ctx.lineWidth = 1.4; ctx.stroke();
+  ctx.restore();
+}
+function drawGem(g) {
+  const s = g.r * (1 + Math.sin(g.tw) * 0.14);
+  ctx.save(); ctx.translate(g.x, g.y);
+  ctx.shadowColor = "#ffd94d"; ctx.shadowBlur = 16;
+  ctx.beginPath();
+  for (let i = 0; i < 8; i++) {
+    const a = i * Math.PI / 4, d = i % 2 ? s * 0.42 : s;
+    const px = Math.cos(a) * d, py = Math.sin(a) * d;
+    i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+  }
+  ctx.closePath(); ctx.fillStyle = "#ffd94d"; ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.beginPath(); ctx.arc(0, 0, 2.6, 0, TAU); ctx.fillStyle = "#fff6d8"; ctx.fill();
+  ctx.restore();
+}
+function text(str, x, y, size, color, align = "left", bold = true) {
+  ctx.font = `${bold ? "700 " : ""}${size}px "Segoe UI", system-ui, sans-serif`;
+  ctx.textAlign = align; ctx.fillStyle = color; ctx.fillText(str, x, y);
+}
+function draw() {
+  // deep-space gradient
+  const gr = ctx.createLinearGradient(0, 0, 0, H);
+  gr.addColorStop(0, "#070818"); gr.addColorStop(0.6, "#0a0a26"); gr.addColorStop(1, "#120826");
+  ctx.fillStyle = gr; ctx.fillRect(0, 0, W, H);
+  // starfield
+  for (const L of layers) for (const s of L.stars) {
+    ctx.globalAlpha = 0.55 + Math.sin(s.tw) * 0.3;
+    ctx.fillStyle = L.color;
+    ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, TAU); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  for (const g of gems) drawGem(g);
+  for (const r of rocks) drawRock(r);
+  if (ship.alive) drawShip();
+  for (const p of parts) {
+    ctx.globalAlpha = 1 - p.age / p.life;
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, TAU); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  for (const f of floaters) {
+    ctx.globalAlpha = 1 - f.age / 0.9;
+    text(f.txt, f.x, f.y, 20, "#ffd94d", "center");
+  }
+  ctx.globalAlpha = 1;
+
+  // HUD
+  text("SCORE " + String(score).padStart(4, "0"), 22, 38, 24, "#eaf6ff");
+  text("SPEED x" + speedMul.toFixed(1), W - 22, 38, 24,
+       speedMul > 1.8 ? "#ff5d8f" : "#eaf6ff", "right");
+  text("BEST " + String(best).padStart(4, "0"), 22, 66, 15, "#8fa3c8");
+
+  if (state === "title") {
+    ctx.fillStyle = "rgba(4,5,16,.55)"; ctx.fillRect(0, 0, W, H);
+    ctx.save();
+    ctx.shadowColor = "#00e5ff"; ctx.shadowBlur = 34;
+    text("NEON DRIFT", W / 2, 218, 84, "#00e5ff", "center");
+    ctx.restore();
+    ctx.save();
+    ctx.shadowColor = "#ff2bd6"; ctx.shadowBlur = 22;
+    text("DODGE · COLLECT · SURVIVE", W / 2, 268, 26, "#ff2bd6", "center");
+    ctx.restore();
+    text("Arrow keys / WASD / mouse / touch to steer", W / 2, 330, 20, "#cfe3ff", "center");
+    text("Press SPACE or click to launch", W / 2, 368, 20, "#ffd94d", "center");
+  }
+  if (state === "over") {
+    ctx.fillStyle = "rgba(4,5,16,.5)"; ctx.fillRect(0, 0, W, H);
+    ctx.save();
+    ctx.shadowColor = "#ff2bd6"; ctx.shadowBlur = 30;
+    text("DRIFT OVER", W / 2, 226, 64, "#ff2bd6", "center");
+    ctx.restore();
+    text("Score " + score + "   ·   Best " + best, W / 2, 282, 26, "#eaf6ff", "center");
+    text("Press R to fly again", W / 2, 330, 20, "#ffd94d", "center");
+  }
+}
+
+// ---------- main loop ----------
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.033, (now - last) / 1000);
+  last = now;
+  if (!paused) update(dt);
+  draw();
+  if (paused && state === "play")
+    text("PAUSED — P to resume", W / 2, H / 2, 34, "#ffd94d", "center");
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
